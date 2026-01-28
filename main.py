@@ -12,7 +12,9 @@ from pipeline.detection import detect_hash_and_numbers, detect_players_and_poses
 from pipeline.processing import fuse_detections
 from pipeline.geometry import estimate_homography, homography_quality, smooth_homography
 from pipeline.visualization import draw_overlay
+
 from pipeline.utils import resolve_device
+from pipeline.utils.mappings import cls_to_yards
 
 
 def _project_points(H: np.ndarray, pts: np.ndarray) -> np.ndarray:
@@ -41,6 +43,8 @@ def main(
     conf_alpha: float = typer.Option(0.85, help="EMA smoothing factor for yard-number confidences"),
     min_ema_conf: float = typer.Option(0.25, help="Minimum EMA confidence to accept a yardline class"),
     player_conf: float = typer.Option(0.5, help="Confidence threshold for player detection"),
+    pose_conf: float = typer.Option(0.7, help="Confidence threshold for pose estimation on detected players"),
+    target_fps: float = typer.Option(30.0, help="Target FPS for processing (default: 30, use -1 for all frames)"),
     enable_player_poses: bool = typer.Option(True, help="Enable player detection and pose estimation"),
 ):
     """Run the football field analysis pipeline on a video."""
@@ -63,18 +67,15 @@ def main(
     
     resolved_device = resolve_device(device)
     # Choose devices per model to avoid MPS pose bug
-    hash_device = resolved_device
-    numbers_device = resolved_device
-    player_device = resolved_device
-    pose_device = resolved_device
+    keypoint_device = resolved_device
     
     try:
         h_task = getattr(h_model, "task", "")
     except Exception:
         h_task = ""
-    if resolved_device == "mps" and h_task == "pose":
+    if resolved_device == "mps" and (h_task == "pose" or h_task == "hash"):
         print("[yellow]MPS pose warning detected: routing hash (pose) model to CPU; numbers remain on MPS[/yellow]")
-        hash_device = "cpu"
+        keypoint_device = "cpu"
     
     # Check pose model task for player poses
     if enable_player_poses:
@@ -84,11 +85,11 @@ def main(
             pose_task = ""
         if resolved_device == "mps" and pose_task == "pose":
             print("[yellow]MPS pose warning: routing player pose model to CPU[/yellow]")
-            pose_device = "cpu"
+            keypoint_device = "cpu"
     
-    print(f"Using devices -> hash: {hash_device}, numbers: {numbers_device}")
+    print(f"Using devices -> hash: {keypoint_device}, numbers: {resolved_device}")
     if enable_player_poses:
-        print(f"             -> player: {player_device}, pose: {pose_device}")
+        print(f"              -> player: {resolved_device}, pose: {keypoint_device}")
 
     tpl = cv2.imread(str(field_template))
     if tpl is None:
@@ -98,17 +99,34 @@ def main(
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video}")
 
+    # Get source video FPS
+    source_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    
+    # Calculate frame skip interval if target_fps is specified
+    frame_skip = 1
+    if target_fps < 0:
+        # -1 means process all frames
+        output_fps = source_fps
+        print(f"[cyan]Processing all frames at {source_fps:.1f} FPS[/cyan]")
+    elif target_fps >= source_fps:
+        print(f"[yellow]Warning: target-fps ({target_fps}) >= source fps ({source_fps:.1f}), processing all frames[/yellow]")
+        output_fps = source_fps
+    else:
+        frame_skip = int(source_fps / target_fps)
+        output_fps = source_fps / frame_skip
+        print(f"[cyan]Processing every {frame_skip} frame(s) -> ~{output_fps:.1f} FPS output[/cyan]")
+
     # Prepare writer if needed
     writer = None
     if out is not None:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        writer = cv2.VideoWriter(str(out), fourcc, fps, (w, h))
+        writer = cv2.VideoWriter(str(out), fourcc, output_fps, (w, h))
 
     results_meta = []
     frame_idx = 0
+    processed_frame_idx = 0  # Index of actually processed frames
     last_H_used: Optional[np.ndarray] = None
     last_yard_value: Optional[int] = None
     # EMA state for yard-number class confidences
@@ -123,14 +141,20 @@ def main(
         if not ret:
             break
 
-        hash_dets, number_dets = detect_hash_and_numbers(frame, h_model, n_model, hash_device, numbers_device)
+        # Skip frames if target_fps is set
+        if frame_idx % frame_skip != 0:
+            frame_idx += 1
+            continue
+
+        hash_dets, number_dets = detect_hash_and_numbers(frame, h_model, n_model, keypoint_device, resolved_device)
         fused = fuse_detections(hash_dets, number_dets, (tpl.shape[1], tpl.shape[0]))
         
         # Detect players and poses if enabled
         player_dets = []
         if enable_player_poses:
             player_dets = detect_players_and_poses(
-                frame, p_model, pose_m, player_device, pose_device, player_conf_thresh=player_conf
+                frame, p_model, pose_m, resolved_device, keypoint_device, 
+                player_conf_thresh=player_conf, pose_conf_thresh=pose_conf  # type: ignore
             )
         
         # Update anchor cache with new high-quality lines
@@ -152,10 +176,8 @@ def main(
                     # New yardline or spatial location - add to cache
                     anchor_cache.append({"line": line, "frame": frame_idx, "age": 0})
         
-        # Age out old cache entries and increment age
-        anchor_cache = [c for c in anchor_cache if c["age"] < MAX_CACHE_AGE]
-        for c in anchor_cache:
-            c["age"] += 1
+        # Age out old cache entries and increment age in a single pass
+        anchor_cache = [{**c, "age": c["age"] + 1} for c in anchor_cache if c["age"] < MAX_CACHE_AGE - 1]
 
         # Refine anchors by merging current detections with recent cache
         # Build enhanced anchor set from cache (best lines from recent history)
@@ -173,11 +195,13 @@ def main(
             def yard_to_template_x(yards: int) -> float:
                 return (yards / 100.0) * TEMPLATE_W
             
-            for line in cache_lines[:4]:  # Use up to 4 best cached lines
-                if "yard" in line and 0 <= line["yard"] <= 100:
-                    X = yard_to_template_x(line["yard"])
-                    refined_anchors_img.extend([line["top"], line["bot"]])
-                    refined_anchors_field.extend([(X, HASH_TOP_Y), (X, HASH_BOT_Y)])
+            # Filter valid lines and build anchors - compute X once per line
+            valid_lines = [(line, yard_to_template_x(line["yard"])) 
+                          for line in cache_lines[:4] 
+                          if "yard" in line and 0 <= line["yard"] <= 100]
+            
+            refined_anchors_img = [pt for line, _ in valid_lines for pt in [line["top"], line["bot"]]]
+            refined_anchors_field = [pt for _, X in valid_lines for pt in [(X, HASH_TOP_Y), (X, HASH_BOT_Y)]]
             
             # If we have better anchors from cache, use them
             if len(refined_anchors_img) >= len(fused["anchors_img"]) and len(refined_anchors_img) >= 4:
@@ -214,18 +238,19 @@ def main(
             H_used = last_H_used
 
         # Yardline selection with EMA-smoothed class confidences
-        from pipeline.utils.mappings import cls_to_yards
+
         
         # 1) build current per-class confidences (max per class in this frame)
         cur_conf: Dict[int, float] = {10: 0.0, 20: 0.0, 30: 0.0, 40: 0.0, 50: 0.0}
         for d in number_dets:
             yv = cls_to_yards(d.get("cls", -1))
-            if yv is None:
-                continue
-            cur_conf[yv] = max(cur_conf[yv], float(d.get("conf", 0.0)))
-        # 2) update EMA per class
-        for y in ema_conf.keys():
-            ema_conf[y] = conf_alpha * ema_conf[y] + (1.0 - conf_alpha) * cur_conf[y]
+            if yv is not None:
+                cur_conf[yv] = max(cur_conf[yv], float(d.get("conf", 0.0)))
+        
+        # 2) update EMA per class - vectorized dict comprehension
+        ema_conf = {y: conf_alpha * ema_conf[y] + (1.0 - conf_alpha) * cur_conf[y] 
+                    for y in ema_conf.keys()}
+        
         # 3) choose best EMA class if strong enough; else fallback to per-frame fused yard
         best_yard = max(ema_conf.keys(), key=lambda k: ema_conf[k])
         yard_val = fused["yard_value"]
@@ -272,6 +297,7 @@ def main(
             "players": player_data,
         })
 
+        processed_frame_idx += 1
         frame_idx += 1
 
     cap.release()
@@ -283,7 +309,7 @@ def main(
             json.dump(results_meta, f, indent=2)
         print(f"Saved JSON: {write_json}")
 
-    print("[green]Done.[/green]")
+    print(f"[green]Done. Processed {processed_frame_idx} frames (of {frame_idx} total).[/green]")
 
 
 if __name__ == "__main__":

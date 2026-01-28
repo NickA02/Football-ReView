@@ -35,13 +35,39 @@ def draw_overlay(
     
     # Draw hash lines/keypoints
     for d in hash_dets:
+        conf = d.get("conf", 0.0)
+        
+        # If we have a line representation
         if d.get("line") is not None:
             x1, y1, x2, y2 = d["line"]
-            cv2.line(out, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            cv2.line(out, (x1, y1), (x2, y2), (255, 0, 0), 3)  # Blue line (thicker)
+            # Label the hash mark
+            cv2.putText(out, f"Hash {conf:.2f}", (x1 + 5, y1 + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        
+        # If we have keypoint representation (should be 2 points: top and bottom hash intersections)
         if d.get("keypoints") is not None:
-            kp = np.array(d["keypoints"])[:2]
-            for p in kp:
-                cv2.circle(out, (int(p[0]), int(p[1])), 4, (0, 0, 255), -1)
+            kp = np.array(d["keypoints"])
+            # Handle different keypoint formats
+            if kp.ndim == 2:
+                kp = kp[:2]  # Take first 2 keypoints
+            
+            # Draw the keypoints
+            for i, p in enumerate(kp):
+                x, y = int(p[0]), int(p[1])
+                cv2.circle(out, (x, y), 6, (255, 0, 0), -1)  # Blue filled circle
+                cv2.circle(out, (x, y), 8, (0, 0, 255), 2)    # Red outline for visibility
+            
+            # Draw line connecting the two hash keypoints
+            if len(kp) >= 2:
+                pt1 = (int(kp[0][0]), int(kp[0][1]))
+                pt2 = (int(kp[1][0]), int(kp[1][1]))
+                cv2.line(out, pt1, pt2, (255, 100, 0), 2)  # Blue-ish line
+                # Label the hash mark
+                mid_x = (pt1[0] + pt2[0]) // 2
+                mid_y = (pt1[1] + pt2[1]) // 2
+                cv2.putText(out, f"Hash {conf:.2f}", (mid_x + 5, mid_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
     
     # Draw player detections and poses
     if player_dets:
