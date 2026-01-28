@@ -27,7 +27,9 @@ def load_models(
     player_model_path: Optional[str] = None,
     pose_model_path: Optional[str] = None,
 ) -> Tuple[YOLO, YOLO, Optional[YOLO], Optional[YOLO]]:
+    print(f"[bold]Loading hash model from:[/bold] {hash_model_path}")
     hash_model = YOLO(hash_model_path)
+
     number_model = YOLO(number_model_path)
     player_model = YOLO(player_model_path) if player_model_path else None
     pose_model = YOLO(pose_model_path) if pose_model_path else None
